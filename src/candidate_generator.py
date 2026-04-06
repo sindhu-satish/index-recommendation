@@ -140,7 +140,7 @@ def generate_candidates(workload: list, min_frequency: int=2) -> list:
     return candidates
 if __name__ == '__main__':
     workload = parse_workload(QUERIES_DIR)
-    candidates = generate_candidates(workload)
-    print(f"Total candidates: {len(candidates)}")
-    for c in candidates:
-        print(c)
+    frequencies = count_column_frequency(workload)
+    print("Top 10 columns by frequency:")
+    for key, count in sorted(frequencies.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"  {count:3} {key}")

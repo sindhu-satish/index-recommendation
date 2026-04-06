@@ -75,12 +75,15 @@ order by
 where rownum <= 20;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (12):
+EXTRACTED COLUMNS (15):
   WHERE      equality   customer.c_custkey
+  WHERE      equality   orders.o_custkey
   WHERE      equality   lineitem.l_orderkey
+  WHERE      equality   orders.o_orderkey
   WHERE      range      orders.o_orderdate
   WHERE      equality   lineitem.l_returnflag
   WHERE      equality   customer.c_nationkey
+  WHERE      equality   nation.n_nationkey
   GROUP BY   n/a        customer.c_custkey
   GROUP BY   n/a        customer.c_name
   GROUP BY   n/a        customer.c_acctbal
@@ -125,11 +128,15 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (4):
+EXTRACTED COLUMNS (8):
   WHERE      equality   partsupp.ps_suppkey
+  WHERE      equality   supplier.s_suppkey
   WHERE      equality   supplier.s_nationkey
+  WHERE      equality   nation.n_nationkey
   WHERE      equality   nation.n_name
   GROUP BY   n/a        partsupp.ps_partkey
+  WHERE      range      partsupp.ps_supplycost
+  WHERE      range      partsupp.ps_availqty
 
 ============================================================
 QUERY: q12
@@ -168,12 +175,13 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (7):
+EXTRACTED COLUMNS (8):
   WHERE      equality   orders.o_orderkey
+  WHERE      equality   lineitem.l_orderkey
   WHERE      equality   lineitem.l_shipmode
   WHERE      range      lineitem.l_commitdate
-  WHERE      range      lineitem.l_shipdate
   WHERE      range      lineitem.l_receiptdate
+  WHERE      range      lineitem.l_shipdate
   GROUP BY   n/a        lineitem.l_shipmode
   ORDER BY   n/a        lineitem.l_shipmode
 
@@ -206,10 +214,13 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (3):
+EXTRACTED COLUMNS (6):
+  WHERE      equality   customer.c_custkey
+  WHERE      equality   orders.o_custkey
+  WHERE      equality   orders.o_comment
+  GROUP BY   n/a        customer.c_custkey
   GROUP BY   n/a        customer.c_count
   ORDER BY   n/a        customer.c_count
-  GROUP BY   n/a        customer.c_custkey
 
 ============================================================
 QUERY: q14
@@ -233,8 +244,9 @@ where
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (2):
+EXTRACTED COLUMNS (3):
   WHERE      equality   lineitem.l_partkey
+  WHERE      equality   part.p_partkey
   WHERE      range      lineitem.l_shipdate
 
 ============================================================
@@ -322,8 +334,9 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (11):
+EXTRACTED COLUMNS (12):
   WHERE      equality   part.p_partkey
+  WHERE      equality   partsupp.ps_partkey
   WHERE      equality   part.p_brand
   WHERE      equality   part.p_type
   WHERE      equality   part.p_size
@@ -363,10 +376,10 @@ where rownum <= -1;
 ────────────────────────────────────────────────────────────
 EXTRACTED COLUMNS (5):
   WHERE      equality   part.p_partkey
+  WHERE      equality   lineitem.l_partkey
   WHERE      equality   part.p_brand
   WHERE      equality   part.p_container
   WHERE      range      lineitem.l_quantity
-  WHERE      equality   lineitem.l_partkey
 
 ============================================================
 QUERY: q18
@@ -409,10 +422,13 @@ order by
 where rownum <= 100;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (10):
+EXTRACTED COLUMNS (13):
   WHERE      equality   orders.o_orderkey
   GROUP BY   n/a        lineitem.l_orderkey
+  WHERE      range      lineitem.l_quantity
   WHERE      equality   customer.c_custkey
+  WHERE      equality   orders.o_custkey
+  WHERE      equality   lineitem.l_orderkey
   GROUP BY   n/a        customer.c_name
   GROUP BY   n/a        customer.c_custkey
   GROUP BY   n/a        orders.o_orderkey
@@ -465,10 +481,14 @@ where
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (4):
+EXTRACTED COLUMNS (8):
   WHERE      equality   part.p_partkey
+  WHERE      equality   lineitem.l_partkey
   WHERE      equality   part.p_brand
+  WHERE      equality   part.p_container
   WHERE      range      lineitem.l_quantity
+  WHERE      range      part.p_size
+  WHERE      equality   lineitem.l_shipmode
   WHERE      equality   lineitem.l_shipinstruct
 
 ============================================================
@@ -523,13 +543,17 @@ order by
 where rownum <= 100;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (12):
+EXTRACTED COLUMNS (16):
   WHERE      equality   part.p_partkey
+  WHERE      equality   partsupp.ps_partkey
   WHERE      equality   supplier.s_suppkey
+  WHERE      equality   partsupp.ps_suppkey
   WHERE      equality   part.p_size
   WHERE      equality   part.p_type
   WHERE      equality   supplier.s_nationkey
+  WHERE      equality   nation.n_nationkey
   WHERE      equality   nation.n_regionkey
+  WHERE      equality   region.r_regionkey
   WHERE      equality   region.r_name
   WHERE      equality   partsupp.ps_supplycost
   ORDER BY   n/a        supplier.s_acctbal
@@ -583,15 +607,17 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (10):
+EXTRACTED COLUMNS (12):
   WHERE      equality   supplier.s_suppkey
   WHERE      equality   partsupp.ps_partkey
   WHERE      equality   part.p_name
   WHERE      range      partsupp.ps_availqty
   WHERE      equality   lineitem.l_partkey
   WHERE      equality   lineitem.l_suppkey
+  WHERE      equality   partsupp.ps_suppkey
   WHERE      range      lineitem.l_shipdate
   WHERE      equality   supplier.s_nationkey
+  WHERE      equality   nation.n_nationkey
   WHERE      equality   nation.n_name
   ORDER BY   n/a        supplier.s_name
 
@@ -643,14 +669,16 @@ order by
 where rownum <= 100;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (10):
+EXTRACTED COLUMNS (12):
   WHERE      equality   supplier.s_suppkey
+  WHERE      equality   lineitem.l_suppkey
   WHERE      equality   orders.o_orderkey
+  WHERE      equality   lineitem.l_orderkey
   WHERE      equality   orders.o_orderstatus
   WHERE      range      lineitem.l_receiptdate
-  WHERE      equality   lineitem.l_orderkey
-  WHERE      equality   lineitem.l_suppkey
+  WHERE      range      lineitem.l_commitdate
   WHERE      equality   supplier.s_nationkey
+  WHERE      equality   nation.n_nationkey
   WHERE      equality   nation.n_name
   GROUP BY   n/a        supplier.s_name
   ORDER BY   n/a        supplier.s_name
@@ -701,9 +729,11 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (2):
+EXTRACTED COLUMNS (4):
+  WHERE      equality   customer.c_phone
   WHERE      range      customer.c_acctbal
   WHERE      equality   orders.o_custkey
+  WHERE      equality   customer.c_custkey
 
 ============================================================
 QUERY: q3
@@ -736,10 +766,12 @@ order by
 where rownum <= 10;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (9):
+EXTRACTED COLUMNS (11):
   WHERE      equality   customer.c_mktsegment
   WHERE      equality   customer.c_custkey
+  WHERE      equality   orders.o_custkey
   WHERE      equality   lineitem.l_orderkey
+  WHERE      equality   orders.o_orderkey
   WHERE      range      orders.o_orderdate
   WHERE      range      lineitem.l_shipdate
   GROUP BY   n/a        lineitem.l_orderkey
@@ -777,10 +809,12 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (5):
+EXTRACTED COLUMNS (7):
   WHERE      range      orders.o_orderdate
   WHERE      equality   lineitem.l_orderkey
+  WHERE      equality   orders.o_orderkey
   WHERE      range      lineitem.l_commitdate
+  WHERE      range      lineitem.l_receiptdate
   GROUP BY   n/a        orders.o_orderpriority
   ORDER BY   n/a        orders.o_orderpriority
 
@@ -817,13 +851,18 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (9):
+EXTRACTED COLUMNS (14):
   WHERE      equality   customer.c_custkey
+  WHERE      equality   orders.o_custkey
   WHERE      equality   lineitem.l_orderkey
+  WHERE      equality   orders.o_orderkey
   WHERE      equality   lineitem.l_suppkey
+  WHERE      equality   supplier.s_suppkey
   WHERE      equality   customer.c_nationkey
   WHERE      equality   supplier.s_nationkey
+  WHERE      equality   nation.n_nationkey
   WHERE      equality   nation.n_regionkey
+  WHERE      equality   region.r_regionkey
   WHERE      equality   region.r_name
   WHERE      range      orders.o_orderdate
   GROUP BY   n/a        nation.n_name
@@ -899,15 +938,20 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (8):
+EXTRACTED COLUMNS (13):
+  WHERE      equality   supplier.s_suppkey
+  WHERE      equality   lineitem.l_suppkey
+  WHERE      equality   orders.o_orderkey
+  WHERE      equality   lineitem.l_orderkey
+  WHERE      equality   customer.c_custkey
+  WHERE      equality   orders.o_custkey
+  WHERE      equality   supplier.s_nationkey
+  WHERE      equality   nation.n_nationkey
+  WHERE      equality   customer.c_nationkey
+  WHERE      equality   nation.n_name
+  WHERE      range      lineitem.l_shipdate
   GROUP BY   n/a        lineitem.l_year
   ORDER BY   n/a        lineitem.l_year
-  WHERE      equality   supplier.s_suppkey
-  WHERE      equality   orders.o_orderkey
-  WHERE      equality   customer.c_custkey
-  WHERE      equality   supplier.s_nationkey
-  WHERE      equality   customer.c_nationkey
-  WHERE      range      lineitem.l_shipdate
 
 ============================================================
 QUERY: q8
@@ -955,19 +999,25 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (12):
-  GROUP BY   n/a        orders.o_year
-  ORDER BY   n/a        orders.o_year
+EXTRACTED COLUMNS (18):
   WHERE      equality   part.p_partkey
+  WHERE      equality   lineitem.l_partkey
   WHERE      equality   supplier.s_suppkey
+  WHERE      equality   lineitem.l_suppkey
   WHERE      equality   lineitem.l_orderkey
+  WHERE      equality   orders.o_orderkey
   WHERE      equality   orders.o_custkey
+  WHERE      equality   customer.c_custkey
   WHERE      equality   customer.c_nationkey
+  WHERE      equality   nation.n_nationkey
   WHERE      equality   nation.n_regionkey
+  WHERE      equality   region.r_regionkey
   WHERE      equality   region.r_name
   WHERE      equality   supplier.s_nationkey
   WHERE      range      orders.o_orderdate
   WHERE      equality   part.p_type
+  GROUP BY   n/a        orders.o_year
+  ORDER BY   n/a        orders.o_year
 
 ============================================================
 QUERY: q9
@@ -1010,16 +1060,20 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (9):
-  GROUP BY   n/a        orders.o_year
-  ORDER BY   n/a        orders.o_year
+EXTRACTED COLUMNS (13):
   WHERE      equality   supplier.s_suppkey
+  WHERE      equality   lineitem.l_suppkey
   WHERE      equality   partsupp.ps_suppkey
   WHERE      equality   partsupp.ps_partkey
+  WHERE      equality   lineitem.l_partkey
   WHERE      equality   part.p_partkey
   WHERE      equality   orders.o_orderkey
+  WHERE      equality   lineitem.l_orderkey
   WHERE      equality   supplier.s_nationkey
+  WHERE      equality   nation.n_nationkey
   WHERE      equality   part.p_name
+  GROUP BY   n/a        orders.o_year
+  ORDER BY   n/a        orders.o_year
 
 ============================================================
-TOTAL COLUMN REFERENCES: 154
+TOTAL COLUMN REFERENCES: 208

@@ -86,162 +86,123 @@ def load_queries(queries_dir: str) -> dict:
     return queries
 
 
+def extract_columns_from_token(token, clause, predicate_type='n/a'):
+    """
+    Recursively flattens an AST token and extracts any TPC-H columns.
+    Bypasses all nesting issues (functions, math ops, double parentheses).
+    """
+    cols = []
+    # .flatten() yields all leaf nodes, destroying nested structures
+    for leaf in token.flatten():
+        val = str(leaf).strip()
+        # Look for TPC-H column signatures: contains '_' and isn't a literal string
+        if '_' in val and not val.startswith("'") and not val.startswith('"'):
+            # Strip table aliases (e.g., "l1.l_suppkey" -> "l_suppkey")
+            col_name = val.split('.')[-1].lower()
+            prefix = col_name.split('_')[0]
+            
+            if prefix in PREFIX_TO_TABLE:
+                cols.append({
+                    'table': PREFIX_TO_TABLE[prefix],
+                    'column': col_name,
+                    'clause': clause,
+                    'predicate_type': predicate_type
+                })
+    return cols
+
+
 def extract_columns(sql: str) -> list:
     """
-    Parse a single SQL query and extract all column references from
-    WHERE, GROUP BY, and ORDER BY clauses.
-
-    Handles:
-    1. Direct comparisons in WHERE: col = val, col > val
-    2. col IN (SELECT ...) and col BETWEEN — captured with correct predicate type
-    3. Parenthesized grouped conditions: (col = val OR col = val)
-    4. Subqueries in WHERE: col > (SELECT ...)
-    5. Subqueries in FROM: SELECT ... FROM (SELECT ... WHERE ...)
-    6. Table aliases: l1.l_suppkey, n1.n_name etc.
-
-    Only columns with a recognized TPC-H prefix are included.
-    Duplicate references (same table/column/clause) are removed.
+    Parses a SQL query using a recursive walker to catch ALL nested columns
+    in WHERE, ON, HAVING, GROUP BY, and ORDER BY clauses.
     """
     results = []
     parsed = sqlparse.parse(sql)[0]
+    
+    # State tracking so we know what clause we are currently walking inside
+    current_clause = 'n/a'
 
-    for token in parsed.tokens:
-        if token.is_whitespace:
-            continue
+    def walk(token_list):
+        nonlocal current_clause
+        idx = 0
+        tokens = token_list.tokens
+        
+        while idx < len(tokens):
+            token = tokens[idx]
 
-        # -- WHERE clause --
-        if isinstance(token, sqlparse.sql.Where):
-            for item in token.tokens:
-                if item.is_whitespace:
-                    continue
+            if token.is_whitespace:
+                idx += 1
+                continue
 
-                # direct comparison: l_shipdate <= date '1998-12-01'
-                if isinstance(item, sqlparse.sql.Comparison):
-                    column_name = strip_alias(str(item.left).strip())
-                    prefix = column_name.split('_')[0]
-                    if prefix in PREFIX_TO_TABLE:
-                        results.append({
-                            'table': PREFIX_TO_TABLE[prefix],
-                            'column': column_name,
-                            'clause': 'WHERE',
-                            'predicate_type': get_predicate_type(get_operator(item))
-                        })
-                    # check if right side is a subquery
-                    # e.g. ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM lineitem WHERE ...)
-                    if isinstance(item.right, sqlparse.sql.Parenthesis):
-                        right_str = str(item.right)[1:-1]
-                        if 'select' in right_str.lower():
-                            results.extend(extract_columns(right_str))
+            # 1. Update Context based on Keywords
+            if token.ttype in (sqlparse.tokens.Keyword, sqlparse.tokens.Keyword.DML):
+                val = token.value.upper()
+                if val in ('WHERE', 'ON', 'HAVING'):
+                    # Treat ON and HAVING as WHERE for index recommendation purposes
+                    current_clause = 'WHERE'
+                elif val == 'GROUP BY':
+                    current_clause = 'GROUP BY'
+                elif val == 'ORDER BY':
+                    current_clause = 'ORDER BY'
+                elif val in ('SELECT', 'FROM'):
+                    current_clause = 'n/a' # Stop extracting until we hit WHERE/ON/GROUP BY
 
-                # col IN (...) or col BETWEEN ... AND ...
-                # sqlparse splits these into: Identifier(col) → Keyword → values
-                elif isinstance(item, sqlparse.sql.Identifier):
-                    idx = token.tokens.index(item)
-                    for k in range(idx + 1, len(token.tokens)):
-                        if not token.tokens[k].is_whitespace:
-                            next_t = token.tokens[k]
-                            if next_t.ttype is sqlparse.tokens.Keyword:
-                                normalized = next_t.normalized.upper()
-                                if normalized == 'IN':
-                                    predicate = 'equality'
-                                elif normalized == 'BETWEEN':
-                                    predicate = 'range'
-                                else:
-                                    break
-                                column_name = strip_alias(str(item).strip())
-                                prefix = column_name.split('_')[0]
-                                if prefix in PREFIX_TO_TABLE:
-                                    results.append({
-                                        'table': PREFIX_TO_TABLE[prefix],
-                                        'column': column_name,
-                                        'clause': 'WHERE',
-                                        'predicate_type': predicate
-                                    })
-                            break
+            # 2. Extract from Filtering Clauses (WHERE, ON, HAVING)
+            if current_clause == 'WHERE':
+                if isinstance(token, sqlparse.sql.Comparison):
+                    try:
+                        op = get_operator(token)
+                        ptype = get_predicate_type(op)
+                    except:
+                        ptype = 'equality' # Fallback for complex comparisons
+                    
+                    # Extract left side (handles functions like substring automatically)
+                    results.extend(extract_columns_from_token(token.left, current_clause, ptype))
+                    
+                    # Extract right side (if it's a subquery, skip and let the recursion handle it)
+                    if not isinstance(token.right, sqlparse.sql.Parenthesis) or 'select' not in str(token.right).lower():
+                        results.extend(extract_columns_from_token(token.right, current_clause, ptype))
 
-                # parenthesis — subquery or grouped conditions
-                elif isinstance(item, sqlparse.sql.Parenthesis):
-                    subquery_str = str(item)[1:-1]
-                    if 'select' in subquery_str.lower():
-                        results.extend(extract_columns(subquery_str))
-                    else:
-                        # grouped condition like q19: (col = val OR col = val)
-                        for subitem in item.tokens:
-                            if isinstance(subitem, sqlparse.sql.Comparison):
-                                column_name = strip_alias(str(subitem.left).strip())
-                                prefix = column_name.split('_')[0]
-                                if prefix in PREFIX_TO_TABLE:
-                                    results.append({
-                                        'table': PREFIX_TO_TABLE[prefix],
-                                        'column': column_name,
-                                        'clause': 'WHERE',
-                                        'predicate_type': get_predicate_type(get_operator(subitem))
-                                    })
+                # Handle IN and BETWEEN 
+                elif isinstance(token, (sqlparse.sql.Identifier, sqlparse.sql.Function)):
+                    peek_idx = idx + 1
+                    while peek_idx < len(tokens) and tokens[peek_idx].is_whitespace:
+                        peek_idx += 1
+                    
+                    if peek_idx < len(tokens):
+                        next_tok = tokens[peek_idx]
+                        if next_tok.ttype is sqlparse.tokens.Keyword:
+                            kw = next_tok.value.upper()
+                            if kw == 'IN':
+                                results.extend(extract_columns_from_token(token, current_clause, 'equality'))
+                            elif kw == 'BETWEEN':
+                                results.extend(extract_columns_from_token(token, current_clause, 'range'))
 
-        # -- ORDER BY clause --
-        if token.ttype is sqlparse.tokens.Keyword and token.normalized == 'ORDER BY':
-            idx = parsed.tokens.index(token)
-            for j in range(idx + 1, len(parsed.tokens)):
-                if not parsed.tokens[j].is_whitespace:
-                    next_token = parsed.tokens[j]
-                    if isinstance(next_token, sqlparse.sql.IdentifierList):
-                        for identifier in next_token.get_identifiers():
-                            column_name = strip_alias(str(identifier).strip().split()[0])
-                            prefix = column_name.split('_')[0]
-                            if prefix in PREFIX_TO_TABLE:
-                                results.append({
-                                    'table': PREFIX_TO_TABLE[prefix],
-                                    'column': column_name,
-                                    'clause': 'ORDER BY'
-                                })
-                    elif isinstance(next_token, sqlparse.sql.Identifier):
-                        column_name = strip_alias(str(next_token).strip().split()[0])
-                        prefix = column_name.split('_')[0]
-                        if prefix in PREFIX_TO_TABLE:
-                            results.append({
-                                'table': PREFIX_TO_TABLE[prefix],
-                                'column': column_name,
-                                'clause': 'ORDER BY'
-                            })
-                    break
+            # 3. Extract from Grouping/Sorting Clauses
+            elif current_clause in ('GROUP BY', 'ORDER BY'):
+                if isinstance(token, (sqlparse.sql.Identifier, sqlparse.sql.IdentifierList, sqlparse.sql.Function)):
+                    results.extend(extract_columns_from_token(token, current_clause, 'n/a'))
 
-        # -- GROUP BY clause --
-        if token.ttype is sqlparse.tokens.Keyword and token.normalized == 'GROUP BY':
-            idx = parsed.tokens.index(token)
-            for j in range(idx + 1, len(parsed.tokens)):
-                if not parsed.tokens[j].is_whitespace:
-                    next_token = parsed.tokens[j]
-                    if isinstance(next_token, sqlparse.sql.IdentifierList):
-                        for identifier in next_token.get_identifiers():
-                            column_name = strip_alias(str(identifier).strip().split()[0])
-                            prefix = column_name.split('_')[0]
-                            if prefix in PREFIX_TO_TABLE:
-                                results.append({
-                                    'table': PREFIX_TO_TABLE[prefix],
-                                    'column': column_name,
-                                    'clause': 'GROUP BY'
-                                })
-                    elif isinstance(next_token, sqlparse.sql.Identifier):
-                        column_name = strip_alias(str(next_token).strip().split()[0])
-                        prefix = column_name.split('_')[0]
-                        if prefix in PREFIX_TO_TABLE:
-                            results.append({
-                                'table': PREFIX_TO_TABLE[prefix],
-                                'column': column_name,
-                                'clause': 'GROUP BY'
-                            })
-                    break
+            # 4. RECURSION: Dive into containers (Parentheses, Where blocks, nested Identifiers)
+            if hasattr(token, 'tokens'):
+                # Save the current state
+                prev_clause = current_clause
+                
+                # If diving into a subquery, turn off extraction until we hit its WHERE/GROUP BY
+                if isinstance(token, sqlparse.sql.Parenthesis) and 'select' in str(token).lower():
+                    current_clause = 'n/a'
+                
+                walk(token) # Dive in
+                
+                # Restore the state when bubbling back out
+                current_clause = prev_clause
 
-    # -- FROM clause subqueries --
-    for token in parsed.tokens:
-        if isinstance(token, sqlparse.sql.Identifier):
-            for subtoken in token.tokens:
-                if isinstance(subtoken, sqlparse.sql.Parenthesis):
-                    subquery_str = str(subtoken)[1:-1]
-                    if 'select' in subquery_str.lower():
-                        results.extend(extract_columns(subquery_str))
+            idx += 1
 
-    # -- Deduplicate --
+    # Start the recursive walk
+    walk(parsed)
+
+    # Deduplicate results
     seen = set()
     unique_results = []
     for r in results:
