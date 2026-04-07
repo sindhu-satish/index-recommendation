@@ -140,7 +140,22 @@ def generate_candidates(workload: list, min_frequency: int=2) -> list:
     return candidates
 if __name__ == '__main__':
     workload = parse_workload(QUERIES_DIR)
+    
+    # Print the frequency stats
     frequencies = count_column_frequency(workload)
     print("Top 10 columns by frequency:")
     for key, count in sorted(frequencies.items(), key=lambda x: x[1], reverse=True)[:10]:
         print(f"  {count:3} {key}")
+        
+    # Generate the candidates and count them
+    candidates = generate_candidates(workload)
+    
+    total_candidates = len(candidates)
+    single_count = sum(1 for c in candidates if len(c['columns']) == 1)
+    composite_count = total_candidates - single_count
+    
+    print(f"\n{'='*40}")
+    print(f"TOTAL CANDIDATES GENERATED: {total_candidates}")
+    print(f"  Single-column indexes: {single_count}")
+    print(f"  Composite indexes:     {composite_count}")
+    print(f"{'='*40}")
