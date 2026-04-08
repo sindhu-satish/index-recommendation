@@ -92,13 +92,23 @@ def extract_columns_from_token(token, clause, predicate_type='n/a'):
     Bypasses all nesting issues (functions, math ops, double parentheses).
     """
     cols = []
+    
+    # 1. Define the fake aliases we want to ignore
+    IGNORE_ALIASES = {'l_year', 'o_year', 'c_count'}
+
     # .flatten() yields all leaf nodes, destroying nested structures
     for leaf in token.flatten():
         val = str(leaf).strip()
+        
         # Look for TPC-H column signatures: contains '_' and isn't a literal string
         if '_' in val and not val.startswith("'") and not val.startswith('"'):
             # Strip table aliases (e.g., "l1.l_suppkey" -> "l_suppkey")
             col_name = val.split('.')[-1].lower()
+            
+            # 2. Skip the column if it is in our ignore list
+            if col_name in IGNORE_ALIASES:
+                continue
+                
             prefix = col_name.split('_')[0]
             
             if prefix in PREFIX_TO_TABLE:

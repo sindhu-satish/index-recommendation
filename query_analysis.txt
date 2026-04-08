@@ -214,13 +214,11 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (6):
+EXTRACTED COLUMNS (4):
   WHERE      equality   customer.c_custkey
   WHERE      equality   orders.o_custkey
   WHERE      equality   orders.o_comment
   GROUP BY   n/a        customer.c_custkey
-  GROUP BY   n/a        customer.c_count
-  ORDER BY   n/a        customer.c_count
 
 ============================================================
 QUERY: q14
@@ -938,7 +936,7 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (13):
+EXTRACTED COLUMNS (11):
   WHERE      equality   supplier.s_suppkey
   WHERE      equality   lineitem.l_suppkey
   WHERE      equality   orders.o_orderkey
@@ -950,8 +948,6 @@ EXTRACTED COLUMNS (13):
   WHERE      equality   customer.c_nationkey
   WHERE      equality   nation.n_name
   WHERE      range      lineitem.l_shipdate
-  GROUP BY   n/a        lineitem.l_year
-  ORDER BY   n/a        lineitem.l_year
 
 ============================================================
 QUERY: q8
@@ -999,7 +995,7 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (18):
+EXTRACTED COLUMNS (16):
   WHERE      equality   part.p_partkey
   WHERE      equality   lineitem.l_partkey
   WHERE      equality   supplier.s_suppkey
@@ -1016,8 +1012,6 @@ EXTRACTED COLUMNS (18):
   WHERE      equality   supplier.s_nationkey
   WHERE      range      orders.o_orderdate
   WHERE      equality   part.p_type
-  GROUP BY   n/a        orders.o_year
-  ORDER BY   n/a        orders.o_year
 
 ============================================================
 QUERY: q9
@@ -1060,7 +1054,7 @@ order by
 where rownum <= -1;
 
 ────────────────────────────────────────────────────────────
-EXTRACTED COLUMNS (13):
+EXTRACTED COLUMNS (11):
   WHERE      equality   supplier.s_suppkey
   WHERE      equality   lineitem.l_suppkey
   WHERE      equality   partsupp.ps_suppkey
@@ -1072,8 +1066,6 @@ EXTRACTED COLUMNS (13):
   WHERE      equality   supplier.s_nationkey
   WHERE      equality   nation.n_nationkey
   WHERE      equality   part.p_name
-  GROUP BY   n/a        orders.o_year
-  ORDER BY   n/a        orders.o_year
 
 ============================================================
-TOTAL COLUMN REFERENCES: 208
+TOTAL COLUMN REFERENCES: 200
