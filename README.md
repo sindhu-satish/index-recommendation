@@ -68,6 +68,19 @@ docker exec -i tpch-db psql -U postgres -d tpch -c "SELECT COUNT(*) FROM lineite
 ```
 
 You should see `6001215` rows.
+### 7. Running the the Full pipeline 
+To run the end-to-end index recommendation system, execute the scripts in the src/ directory in the following sequential order. 
+A. Generate labels HypoPG 
+```python src/hypopg_labeler.py```
+B. Build the Training dataset:
+```python src/training_dataset.py --labels data/labels.csv```
+C. Train the Machine learning model
+```python src/ml_model.py --train```
+or 
+```python ml_model.py --train --no-grid-search```
+D. Get recommendation
+```python src/ml_model.py --recommend --top-k 10```
+
 
 
 
@@ -89,11 +102,13 @@ index-recommendation/
 │   └── schema.sql
 │   └── load_data.sh      ← loads TPC-H data into Docker
 └── src/
-    ├── workload_parser.py
-    ├── candidate_generator.py
-    ├── feature_extractor.py
-    ├── hypopg_labeler.py
-    └── ml_model.py
+    ├── db_utils.py               ← shared connection and DB logic
+    ├── workload_parser.py        ← extracts AST query parameters 
+    ├── candidate_generator.py    ← heuristic & cost-aware pruning
+    ├── feature_extractor.py      ← fetches optimizer costs & physical table stats
+    ├── hypopg_labeler.py         ← virtual index simulation via HypoPG
+    ├── training_dataset.py       ← dataset weaver & log1p scaler
+    └── ml_model.py               ← XGBoost training and recommendation engine
 ```
 
 ## Team
