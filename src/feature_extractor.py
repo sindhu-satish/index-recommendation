@@ -5,36 +5,63 @@ Pulls PostgreSQL catalog statistics (pg_stats) and optimizer estimates from
 EXPLAIN (FORMAT JSON) for workload queries. Produces fixed-width numeric
 summaries suitable for tree-based models.
 
+Changes from original:
+    - get_connection, normalize_query_for_postgres, explain_query_json,
+      _walk_plan, summarize_explain_json all moved to db_utils.py.
+      Imported from there to eliminate circular dependency with workload_parser.
+    - Added estimate_write_penalty: approximates index maintenance cost from
+      table size and index width. Important for workload-driven design —
+      benefit must outweigh write overhead.
+    - Added clustered_candidate feature to build_feature_rows so the model
+      knows when a candidate is competing for the single clustered index slot.
+    - Added workload_clause_features: extracts per-column GROUP BY and ORDER BY
+      cost impact from the updated workload_parser output (in_group_by /
+      in_order_by flags). Exposes 6 new features in build_feature_rows:
+        workload_max_group_by_freq, workload_sum_group_by_freq,
+        workload_max_order_by_freq, workload_sum_order_by_freq,
+        first_col_in_group_by, first_col_in_order_by.
+      This allows the model to learn sort-elimination opportunities: a B+ tree
+      index on a GROUP BY or ORDER BY column lets the optimizer skip an
+      expensive in-memory Sort node entirely. The first_col_* features are
+      particularly important because sort elimination only applies when the
+      leading index column matches the sort key.
+    - Added is_composite feature: binary 1.0/0.0 encoding of candidate_type
+      ('composite' vs 'single'). candidate_type was previously in
+      ID_METADATA_COLUMNS and skipped by infer_numeric_feature_columns entirely.
+      Single vs composite indexes have fundamentally different cost/benefit
+      profiles — composite indexes carry higher write penalty and maintenance
+      cost but can serve multiple predicates and enable index-only scans across
+      more columns. The model was previously blind to this distinction.
+    - Fixed conn.rollback() no-op in explain_workload: autocommit=True makes
+      rollback a no-op. Removed it since EXPLAIN failures leave no state to
+      clean up.
+    - Fixed n_distinct sign in fetch_pg_stats_row: PostgreSQL stores negative
+      n_distinct as a fraction of table rows (e.g. -1.0 = all rows unique,
+      -0.5 = 50% distinct). The model was seeing -1.0 as low cardinality when
+      it actually means highest cardinality. Fixed with abs() so the sign is
+      always positive and the model reads cardinality correctly.
+    - Fixed write_penalty_proxy negative values in estimate_write_penalty:
+      pg_class.reltuples returns -1 when ANALYZE has not been run yet. Clamped
+      with max(0.0, reltuples) so the penalty is never negative.
+    - Made workload-derived features cost-based instead of count-based:
+      workload_column_frequencies and workload_clause_features now sum query_cost
+      so feature extraction aligns with the cost-aware workload_parser and
+      candidate_generator design.
+
 Pipeline position:
     workload_parser → candidate_generator → feature_extractor → hypopg_labeler → ml_model
-
-Requires: running PostgreSQL with TPC-H loaded (.env DB_* vars), same as the rest of the stack.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-import psycopg2
-from dotenv import load_dotenv
-
+from db_utils import get_connection, normalize_query_for_postgres, explain_query_json
 from workload_parser import load_queries, parse_workload
 
 QUERIES_DIR = "queries"
-
-
-def get_connection():
-    load_dotenv()
-    return psycopg2.connect(
-        host=os.getenv("DB_HOST", "localhost"),
-        port=os.getenv("DB_PORT", "5432"),
-        dbname=os.getenv("DB_NAME", "tpch"),
-        user=os.getenv("DB_USER", "postgres"),
-        password=os.getenv("DB_PASSWORD", ""),
-    )
 
 
 def _parse_pg_array(value: Any) -> Optional[List[Any]]:
@@ -46,7 +73,6 @@ def _parse_pg_array(value: Any) -> Optional[List[Any]]:
     if isinstance(value, str):
         if value == "{}":
             return []
-        # Rough parse for common histogram / mcv forms from pg_stats
         inner = value.strip()
         if inner.startswith("{") and inner.endswith("}"):
             inner = inner[1:-1]
@@ -61,10 +87,7 @@ def _histogram_summary(bounds: Any) -> Dict[str, float]:
     """Turn histogram_bounds into a small numeric fingerprint."""
     arr = _parse_pg_array(bounds)
     if not arr:
-        return {
-            "hist_n_buckets": 0.0,
-            "hist_span": 0.0,
-        }
+        return {"hist_n_buckets": 0.0, "hist_span": 0.0}
     n = len(arr)
     try:
         first = float(arr[0])
@@ -97,6 +120,16 @@ def fetch_pg_stats_row(
     """
     One row from pg_stats for (schema, table, column).
     Returns None if missing (e.g. system column or no stats yet).
+
+    n_distinct sign handling: PostgreSQL stores negative n_distinct as a
+    fraction of table rows rather than an absolute count. For example:
+        -1.0  → every value is unique (highest cardinality)
+        -0.5  → ~50% of rows have distinct values
+    The model would misread -1.0 as low cardinality (opposite of reality).
+    abs() normalizes the sign so the model always sees a non-negative value.
+    Note: this loses the fraction-vs-absolute distinction, but for a tree-based
+    model that splits on thresholds, the corrected sign is more important than
+    preserving the exact semantic.
     """
     q = """
         SELECT
@@ -116,16 +149,14 @@ def fetch_pg_stats_row(
         return None
     null_frac, avg_width, n_distinct, correlation, mcf, hb = row
     hist = _histogram_summary(hb)
-    corr = correlation
-    if corr is None:
-        corr = 0.0
-    nd = n_distinct
-    if nd is None:
-        nd = 0.0
+    corr = correlation if correlation is not None else 0.0
+
+    nd = abs(float(n_distinct)) if n_distinct is not None else 0.0
+
     return {
         "null_frac": float(null_frac or 0.0),
         "avg_width": float(avg_width or 0.0),
-        "n_distinct": float(nd),
+        "n_distinct": nd,
         "correlation": float(corr),
         "mcv_top_freq": _mcv_top_freq(mcf),
         **hist,
@@ -193,8 +224,45 @@ def aggregate_column_stats(
         "colstats_mean_hist_buckets": mean("hist_n_buckets"),
     }
 
+
+def estimate_write_penalty(
+    conn, table: str, columns: Sequence[str], schema: str = "public"
+) -> Dict[str, float]:
+    """
+    Approximates the maintenance overhead of an index.
+    A wider index on a table with more rows incurs a higher penalty during
+    INSERT/UPDATE operations.
+
+    reltuples is clamped to 0 with max(0.0, reltuples) because PostgreSQL sets
+    reltuples = -1 when ANALYZE has not been run on the table yet. Without the
+    clamp, the penalty would be negative, which is semantically wrong and
+    misleads the model into thinking a large index has negative write cost.
+    """
+    try:
+        q = """
+            SELECT c.reltuples, c.relpages
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = %s AND c.relname = %s
+        """
+        with conn.cursor() as cur:
+            cur.execute(q, (schema, table))
+            row = cur.fetchone()
+            if not row:
+                return {"write_penalty_proxy": 0.0}
+            reltuples, relpages = row
+
+            # Roughly estimate the width of the index keys (4 bytes per column as a naive baseline)
+            index_width_bytes = len(columns) * 4.0
+
+            penalty = (max(0.0, float(reltuples)) / 1000.0) * index_width_bytes
+            return {"write_penalty_proxy": float(penalty)}
+    except Exception:
+        return {"write_penalty_proxy": 0.0}
+
+
 def list_indexed_column_sets(conn, table: str, schema: str = "public") -> List[Tuple[str, ...]]:
-    """Return list of column tuples for each index on the table (ordered)."""
+    """Return list of column tuples for each non-primary index on the table (ordered)."""
     q = """
         SELECT ARRAY(
             SELECT a.attname
@@ -222,9 +290,7 @@ def list_indexed_column_sets(conn, table: str, schema: str = "public") -> List[T
 def existing_index_overlap_features(
     conn, table: str, columns: Sequence[str], schema: str = "public"
 ) -> Dict[str, float]:
-    """
-    Heuristic: does an index already cover this column set as a prefix?
-    """
+    """Heuristic: does an index already cover this column set as a prefix?"""
     want = tuple(columns)
     idx_sets = list_indexed_column_sets(conn, table, schema)
     exact = 0.0
@@ -240,126 +306,11 @@ def existing_index_overlap_features(
         "n_existing_indexes_on_table": float(len(idx_sets)),
     }
 
-def _walk_plan(node: Mapping[str, Any], acc: Dict[str, float]) -> None:
-    if not isinstance(node, dict):
-        return
-    nt = node.get("Node Type", "")
-    if nt == "Seq Scan":
-        acc["n_seq_scan"] += 1.0
-    elif nt in ("Index Scan", "Index Only Scan", "Bitmap Index Scan"):
-        acc["n_index_scan"] += 1.0
-    for child in node.get("Plans") or []:
-        _walk_plan(child, acc)
-
-
-def summarize_explain_json(explain_parsed: Any) -> Dict[str, float]:
-    """
-    Reduce EXPLAIN JSON to a small numeric dict.
-    explain_parsed is typically a list of one element from PostgreSQL.
-    """
-    acc = {
-        "plan_total_cost": 0.0,
-        "plan_startup_cost": 0.0,
-        "plan_rows": 0.0,
-        "n_seq_scan": 0.0,
-        "n_index_scan": 0.0,
-    }
-    if not explain_parsed or not isinstance(explain_parsed, list):
-        return acc
-    root = explain_parsed[0].get("Plan")
-    if not isinstance(root, dict):
-        return acc
-    acc["plan_total_cost"] = float(root.get("Total Cost") or 0.0)
-    acc["plan_startup_cost"] = float(root.get("Startup Cost") or 0.0)
-    acc["plan_rows"] = float(root.get("Plan Rows") or 0.0)
-    _walk_plan(root, acc)
-    return acc
-
-
-def normalize_query_for_postgres(sql: str) -> str:
-    """
-    Normalize common Oracle-style TPC-H query variants so PostgreSQL can EXPLAIN them.
-    """
-    normalized = sql
-
-    lower = normalized.lower()
-    if "create view revenue0" in lower and "drop view revenue0" in lower:
-        view_match = re.search(
-            r"create\s+view\s+revenue0\s*\([^)]*\)\s*as\s*(select.*?);",
-            normalized,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        create_end = lower.find("create view revenue0")
-        if create_end != -1:
-            create_stmt_end = lower.find(";", create_end)
-        else:
-            create_stmt_end = -1
-        main_select_match = None
-        if create_stmt_end != -1:
-            main_select_match = re.search(
-                r"\bselect\b.*?;",
-                normalized[create_stmt_end + 1 :],
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-
-        if view_match and main_select_match:
-            view_select = view_match.group(1).strip().rstrip(";")
-            main_select = main_select_match.group(0).strip().rstrip(";")
-            normalized = (
-                "WITH revenue0 AS (\n"
-                "    SELECT supplier_no, total_revenue\n"
-                f"    FROM ({view_select}) AS revenue0_base(supplier_no, total_revenue)\n"
-                ")\n"
-                f"{main_select};"
-            )
-        else:
-            end = lower.rfind("drop view revenue0")
-            if end != -1:
-                normalized = normalized[:end]
-
-    normalized = re.sub(
-        r"\n\s*where\s+rownum\s*<=\s*-?\d+\s*;\s*$",
-        ";\n",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-
-    normalized = re.sub(
-        r"interval\s*'(\d+)'\s*day\s*\(\d+\)",
-        r"interval '\1 days'",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-
-    normalized = re.sub(
-        r"interval\s*'(\d+)'\s*month\b",
-        r"interval '\1 months'",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-
-    normalized = normalized.strip()
-    if not normalized.endswith(";"):
-        normalized += ";"
-    return normalized
-
-
-def explain_query_json(conn, sql: str) -> Dict[str, float]:
-    """Run EXPLAIN (FORMAT JSON) and return summarized optimizer features."""
-    stripped = normalize_query_for_postgres(sql).strip().rstrip(";")
-    with conn.cursor() as cur:
-        cur.execute(f"EXPLAIN (FORMAT JSON) {stripped}")
-        (raw,) = cur.fetchone()
-    parsed = json.loads(raw) if isinstance(raw, str) else raw
-    return summarize_explain_json(parsed)
-
 
 def explain_workload(
     conn, queries: Optional[Mapping[str, str]] = None, queries_dir: str = QUERIES_DIR
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Summarized EXPLAIN output per query name.
-    """
+    """Summarized EXPLAIN output per query name."""
     if queries is None:
         queries = load_queries(queries_dir)
     out: Dict[str, Dict[str, float]] = {}
@@ -367,8 +318,7 @@ def explain_workload(
         sql = queries[name]
         try:
             out[name] = explain_query_json(conn, sql)
-        except Exception as ex:  
-            conn.rollback()
+        except Exception as ex:
             print(f"[warn] EXPLAIN failed for {name}: {ex}")
             out[name] = {
                 "plan_total_cost": 0.0,
@@ -386,12 +336,47 @@ def explain_workload(
 
 
 def workload_column_frequencies(workload: List[dict]) -> Dict[str, float]:
-    """Count queries per table.column."""
-    freq: Dict[str, int] = {}
+    """
+    Sum total query_cost per table.column.
+
+    This is cost-based, not count-based, so columns referenced by more expensive
+    queries receive larger feature values. workload_parser already deduplicates
+    (table, column) within a query, so each query contributes its cost at most
+    once per column.
+    """
+    freq: Dict[str, float] = {}
     for item in workload:
         key = f"{item['table']}.{item['column']}"
-        freq[key] = freq.get(key, 0) + 1
-    return {k: float(v) for k, v in freq.items()}
+        freq[key] = freq.get(key, 0.0) + float(item.get("query_cost", 1.0))
+    return freq
+
+
+def workload_clause_features(workload: List[dict]) -> Dict[str, Dict[str, float]]:
+    """
+    Per-column cost impact of how often that column participates in GROUP BY
+    or ORDER BY clauses, using the in_group_by / in_order_by flags added by
+    the updated workload_parser.
+
+    These values are cost-weighted rather than count-weighted: a column used in
+    the ORDER BY of one very expensive query should matter more than one used in
+    many cheap queries.
+
+    Returns dict mapping 'table.column' ->
+        {'group_by_cost': float, 'order_by_cost': float}.
+
+    Safe to call on old-format workloads that lack the clause flags — defaults to 0.
+    """
+    result: Dict[str, Dict[str, float]] = {}
+    for item in workload:
+        key = f"{item['table']}.{item['column']}"
+        if key not in result:
+            result[key] = {"group_by_cost": 0.0, "order_by_cost": 0.0}
+        qcost = float(item.get("query_cost", 1.0))
+        if item.get("in_group_by"):
+            result[key]["group_by_cost"] += qcost
+        if item.get("in_order_by"):
+            result[key]["order_by_cost"] += qcost
+    return result
 
 
 def queries_touching_table(workload: List[dict], table: str) -> Set[str]:
@@ -407,11 +392,28 @@ def build_feature_rows(
     schema: str = "public",
 ) -> List[Dict[str, Any]]:
     """
-    Join candidate index metadata with pg_stats, existing-index flags, workload
-    frequencies, and per-query EXPLAIN summaries for queries that touch the
-    candidate's table.
+    Join candidate index metadata with pg_stats, existing-index flags, write
+    penalty estimates, workload cost-impact features, clause cost features,
+    and per-query EXPLAIN summaries for queries that touch the candidate's table.
 
-    Each row: identifiers + numeric features for a (query_name, candidate) pair.
+    Each row represents one (query_name, candidate) pair.
+
+    Clause features added (6 total):
+        workload_max_group_by_freq  — max GROUP BY cost impact across candidate columns
+        workload_sum_group_by_freq  — sum of GROUP BY cost impact
+        workload_max_order_by_freq  — max ORDER BY cost impact across candidate columns
+        workload_sum_order_by_freq  — sum of ORDER BY cost impact
+        first_col_in_group_by       — 1.0 if the leading column appears in GROUP BY
+        first_col_in_order_by       — 1.0 if the leading column appears in ORDER BY
+
+    The first_col_* features matter most: sort elimination only applies when
+    the leading index column matches the sort key. A composite index on
+    (l_shipdate, l_quantity) eliminates a sort on l_shipdate; one on
+    (l_quantity, l_shipdate) does not.
+
+    Note:
+        The feature names retain *_freq for compatibility with downstream code,
+        but they now represent cost-weighted workload impact rather than raw counts.
     """
     if queries is None:
         queries = load_queries(queries_dir)
@@ -424,27 +426,55 @@ def build_feature_rows(
 
     explain_by_q = explain_workload(conn, queries=queries)
     freqs = workload_column_frequencies(workload)
+    clause_feats = workload_clause_features(workload)
 
     rows: List[Dict[str, Any]] = []
     for cand in candidates:
         table = cand["table"]
         cols = cand["columns"]
+
         colstats = aggregate_column_stats(stats_by_col, cols, table)
         idxmeta = existing_index_overlap_features(conn, table, cols, schema)
+        write_penalty = estimate_write_penalty(conn, table, cols, schema)
         touch = queries_touching_table(workload, table)
+
+        # Per-column GROUP BY / ORDER BY cost impacts
+        group_by_costs = [
+            clause_feats.get(f"{table}.{c}", {}).get("group_by_cost", 0.0)
+            for c in cols
+        ]
+        order_by_costs = [
+            clause_feats.get(f"{table}.{c}", {}).get("order_by_cost", 0.0)
+            for c in cols
+        ]
 
         base = {
             "candidate_table": table,
             "candidate_cols": ",".join(cols),
             "candidate_type": cand.get("type", "unknown"),
             "n_index_columns": float(len(cols)),
+            "is_composite": 1.0 if cand.get("type") == "composite" else 0.0,
+            "clustered_candidate": float(cand.get("clustered_candidate", False)),
             **colstats,
             **idxmeta,
+            **write_penalty,
         }
+
+        # Cost-based workload impact of these columns
         base["workload_max_col_freq"] = max(
             (freqs.get(f"{table}.{c}", 0.0) for c in cols), default=0.0
         )
         base["workload_sum_col_freq"] = sum(freqs.get(f"{table}.{c}", 0.0) for c in cols)
+
+        # Cost-based clause features: sort-elimination signal from GROUP BY / ORDER BY
+        base["workload_max_group_by_freq"] = max(group_by_costs) if group_by_costs else 0.0
+        base["workload_sum_group_by_freq"] = sum(group_by_costs)
+        base["workload_max_order_by_freq"] = max(order_by_costs) if order_by_costs else 0.0
+        base["workload_sum_order_by_freq"] = sum(order_by_costs)
+
+        # Leading-column sort-elimination eligibility signal
+        base["first_col_in_group_by"] = 1.0 if group_by_costs and group_by_costs[0] > 0 else 0.0
+        base["first_col_in_order_by"] = 1.0 if order_by_costs and order_by_costs[0] > 0 else 0.0
 
         for qname in sorted(touch):
             if qname not in explain_by_q:
@@ -461,13 +491,12 @@ def build_feature_rows(
 
 if __name__ == "__main__":
     from pprint import pprint
-
     from candidate_generator import generate_candidates
 
     _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _queries_dir = os.path.join(_repo_root, "queries")
     workload = parse_workload(_queries_dir)
-    candidates = generate_candidates(workload, min_frequency=2)
+    candidates = generate_candidates(workload, min_cost_impact=50000.0)
     conn = get_connection()
     try:
         rows = build_feature_rows(
