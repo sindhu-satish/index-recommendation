@@ -72,17 +72,29 @@ You should see `6001215` rows.
 To run the end-to-end index recommendation system, execute the scripts in the src/ directory in the following sequential order. 
 A. Generate labels HypoPG 
 ```python src/hypopg_labeler.py```
-B. Build the Training dataset:
-```python src/training_dataset.py --labels data/labels.csv```
-C. Train the Machine learning model
-```python src/ml_model.py --train```
-or 
-```python ml_model.py --train --no-grid-search```
+B. Build the Training dataset (default: per-query z-score target; add `--legacy-label` for old signed-log1p-only labels):
+```bash
+python3 src/training_dataset.py --labels data/labels.csv
+```
+C. Train the Machine learning model (re-run B after pulling label-target changes):
+```bash
+python3 src/ml_model.py --train --no-grid-search
+# or: python3 src/ml_model.py --train
+```
 D. Get recommendation
 ```python src/ml_model.py --recommend --top-k 10```
 
+### 8. Physical evaluation (baseline vs created indexes)
 
+After training, this creates the top-k **real** indexes (names `ir_eval_*`), runs `ANALYZE` on touched tables, and compares the full workload **before vs after** using planner cost (same spirit as HypoPG labels). Add `--analyze` to also measure **actual** execution time via `EXPLAIN ANALYZE` (runs every query; slower).
 
+```bash
+python3 src/evaluate_indexes.py --top-k 5
+python3 src/evaluate_indexes.py --top-k 5 --analyze
+python3 src/evaluate_indexes.py --top-k 5 --drop-after   # remove ir_eval_* after measuring
+```
+
+`--dry-run` prints `CREATE INDEX` statements without touching the database.
 
 ## Project Structure
 ```
@@ -108,7 +120,8 @@ index-recommendation/
     ├── feature_extractor.py      ← fetches optimizer costs & physical table stats
     ├── hypopg_labeler.py         ← virtual index simulation via HypoPG
     ├── training_dataset.py       ← dataset weaver & log1p scaler
-    └── ml_model.py               ← XGBoost training and recommendation engine
+    ├── ml_model.py               ← XGBoost training and recommendation engine
+    └── evaluate_indexes.py      ← apply top-k indexes; baseline vs indexed workload metrics
 ```
 
 ## Team

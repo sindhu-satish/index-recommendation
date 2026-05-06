@@ -9,8 +9,9 @@ Input artifacts:
     data/training/test.csv
 
 Those files are produced by training_dataset.py and contain one row per
-(query, candidate index) pair.  The target column `label` is the signed-log1p
-transform of the raw HypoPG optimizer-estimated cost delta.
+(query, candidate index) pair.  By default the target `label` is: winsorized
+HypoPG delta -> signed-log1p -> **per-query z-score** (ranking-friendly).
+Use training_dataset.py --legacy-label for signed-log1p only.
 
 Important:
     - The model predicts optimizer-estimated benefit, not measured runtime.
@@ -83,15 +84,15 @@ LEAKAGE_COLUMNS = {
 FORBIDDEN_COLUMNS = {"clustered_candidate"}
 
 PARAM_GRID = {
-    "learning_rate": [0.05, 0.1],
-    "max_depth": [3, 5],
-    "subsample": [0.8, 1.0],
-    "colsample_bytree": [0.8, 1.0],
-    "n_estimators": [100, 300],
+    "learning_rate": [0.03, 0.08],
+    "max_depth": [2, 4],
+    "subsample": [0.75, 0.9],
+    "colsample_bytree": [0.75, 0.9],
+    "n_estimators": [150, 350],
 }
 
 FIXED_PARAMS = {
-    "early_stopping_rounds": 15,
+    "early_stopping_rounds": 25,
     "eval_metric": "rmse",
     "objective": "reg:squarederror",
     "random_state": 42,
@@ -104,6 +105,36 @@ def feature_cols_path_for_model(model_path: str) -> str:
     """Save/load feature-column order next to the model file."""
     base, _ = os.path.splitext(model_path)
     return f"{base}_feature_cols.txt"
+
+
+def model_target_mode_path(model_path: str) -> str:
+    base, _ = os.path.splitext(model_path)
+    return f"{base}_target_mode.txt"
+
+
+def training_target_mode_path(training_dir: str) -> str:
+    return os.path.join(training_dir, "target_mode.txt")
+
+
+def load_training_target_mode(training_dir: str) -> str:
+    p = training_target_mode_path(training_dir)
+    if os.path.exists(p):
+        with open(p) as f:
+            return f.read().strip().split()[0]
+    return "signed_log1p"
+
+
+def save_model_target_mode(model_path: str, mode: str) -> None:
+    with open(model_target_mode_path(model_path), "w", encoding="utf-8") as f:
+        f.write(mode.strip() + "\n")
+
+
+def load_model_target_mode(model_path: str) -> str:
+    p = model_target_mode_path(model_path)
+    if os.path.exists(p):
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip().split()[0]
+    return "signed_log1p"
 
 
 def inverse_signed_log1p(x: float) -> float:
@@ -271,6 +302,10 @@ def grid_search_cv(
             subsample=params["subsample"],
             colsample_bytree=params["colsample_bytree"],
             n_estimators=params["n_estimators"],
+            min_child_weight=4,
+            reg_lambda=1.2,
+            reg_alpha=0.08,
+            gamma=0.08,
             objective=fixed_params["objective"],
             random_state=fixed_params["random_state"],
             n_jobs=fixed_params["n_jobs"],
@@ -305,13 +340,17 @@ def train_default(train: pd.DataFrame, val: pd.DataFrame, label_col: str) -> Tup
 
     model = xgb.XGBRegressor(
         learning_rate=0.05,
-        max_depth=3,
-        subsample=0.9,
-        colsample_bytree=0.8,
-        n_estimators=300,
+        max_depth=2,
+        min_child_weight=4,
+        reg_lambda=1.2,
+        reg_alpha=0.08,
+        gamma=0.08,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        n_estimators=400,
         random_state=42,
         n_jobs=-1,
-        early_stopping_rounds=15,
+        early_stopping_rounds=25,
         eval_metric="rmse",
         objective="reg:squarederror",
         verbosity=0,
@@ -335,6 +374,10 @@ def train_with_best_params(
         subsample=best_params["subsample"],
         colsample_bytree=best_params["colsample_bytree"],
         n_estimators=best_params["n_estimators"],
+        min_child_weight=4,
+        reg_lambda=1.2,
+        reg_alpha=0.08,
+        gamma=0.08,
         random_state=42,
         n_jobs=-1,
         eval_metric="rmse",
@@ -351,6 +394,7 @@ def evaluate(
     feature_cols: Sequence[str],
     label_col: str = "label",
     split_name: str = "test",
+    target_mode: str = "signed_log1p",
 ) -> dict:
     X, y = feature_matrix(df, feature_cols, label_col)
     preds = model.predict(X)
@@ -359,17 +403,20 @@ def evaluate(
     rmse = math.sqrt(mean_squared_error(y, preds))
     r2 = r2_score(y, preds) if len(y) > 1 else float("nan")
 
-    y_raw = np.array([inverse_signed_log1p(v) for v in y], dtype=np.float64)
-    pred_raw = np.array([inverse_signed_log1p(v) for v in preds], dtype=np.float64)
-    raw_mae = mean_absolute_error(y_raw, pred_raw)
-
-    print(f"\n{split_name.upper()} METRICS")
-    print("  Log-space target metrics:")
+    print(f"\n{split_name.upper()} METRICS (target={target_mode})")
+    print("  Primary (same space as training target):")
     print(f"    MAE : {mae:.4f}")
     print(f"    RMSE: {rmse:.4f}")
     print(f"    R^2 : {r2:.4f}")
-    print("  Raw optimizer-cost-delta scale:")
-    print(f"    MAE : {raw_mae:,.2f}")
+    raw_mae = float("nan")
+    if target_mode != "per_query_zscore":
+        y_raw = np.array([inverse_signed_log1p(v) for v in y], dtype=np.float64)
+        pred_raw = np.array([inverse_signed_log1p(v) for v in preds], dtype=np.float64)
+        raw_mae = mean_absolute_error(y_raw, pred_raw)
+        print("  Raw optimizer-cost-delta scale (inverse signed-log1p):")
+        print(f"    MAE : {raw_mae:,.2f}")
+    else:
+        print("  Raw-scale MAE omitted (label is per-query z-score of signed-log benefit).")
     return {"mae": mae, "rmse": rmse, "r2": r2, "raw_mae": raw_mae}
 
 
@@ -397,7 +444,7 @@ def build_recommendation_features(
 
     conn = get_connection()
     try:
-        rows = build_feature_rows(conn, candidates, workload)
+        rows = build_feature_rows(conn, candidates, workload, queries_dir=queries_dir)
     finally:
         conn.close()
 
@@ -412,21 +459,26 @@ def recommend(
     features_df: pd.DataFrame,
     top_k: int = 5,
     budget: float | None = None,
+    target_mode: str = "signed_log1p",
 ) -> pd.DataFrame:
     """
     Predict benefit for every (query, candidate) row and aggregate to candidates.
 
-    The model predicts signed-log benefit per query-candidate row.  To rank
-    candidate indexes, predictions are inverted back to raw optimizer-cost-delta
-    scale and then summed across source queries.
+    With target_mode=signed_log1p, predictions are mapped through inverse_signed_log1p
+    before summing (legacy). With per_query_zscore, predictions are summed as-is
+    (ranking score in z-score target space).
 
     If `budget` is provided, we perform a simple greedy selection by predicted
     benefit/maintenance proxy using `write_penalty_proxy` as the cost proxy.
     """
     X = feature_matrix_inference(features_df, feature_cols)
     scored = features_df.copy()
-    scored["predicted_log_benefit"] = model.predict(X)
-    scored["predicted_raw_benefit"] = scored["predicted_log_benefit"].map(inverse_signed_log1p)
+    pred = model.predict(X)
+    scored["predicted_log_benefit"] = pred
+    if target_mode == "per_query_zscore":
+        scored["predicted_raw_benefit"] = pred
+    else:
+        scored["predicted_raw_benefit"] = scored["predicted_log_benefit"].map(inverse_signed_log1p)
 
     agg_cols = ["candidate_table", "candidate_cols", "candidate_type"]
     grouped = (
@@ -471,7 +523,7 @@ def recommend(
     return ranked
 
 
-def format_recommendations(ranked: pd.DataFrame) -> None:
+def format_recommendations(ranked: pd.DataFrame, target_mode: str = "signed_log1p") -> None:
     print("\nRECOMMENDED INDEXES")
     print("=" * 78)
     if ranked.empty:
@@ -479,11 +531,16 @@ def format_recommendations(ranked: pd.DataFrame) -> None:
         print("=" * 78)
         return
 
+    score_label = (
+        "Aggregated model score (z-target)"
+        if target_mode == "per_query_zscore"
+        else "Predicted total raw benefit"
+    )
     for rank, row in ranked.iterrows():
         print(f"\n#{rank}")
         print(f"  Selection mode:                 {row.get('selection_mode', 'top_k')}")
-        print(f"  Predicted total raw benefit:    {row['predicted_raw_benefit']:,.2f}")
-        print(f"  Sum of per-query log scores:    {row['predicted_log_score_sum']:.4f}")
+        print(f"  {score_label}:    {row['predicted_raw_benefit']:,.2f}")
+        print(f"  Sum of per-row predictions:     {row['predicted_log_score_sum']:.4f}")
         print(f"  Source query count:             {int(row['query_count'])}")
         print(f"  Candidate workload cost impact: {row['candidate_cost_impact']:,.2f}")
         print(f"  Write penalty proxy:            {row['write_penalty_proxy']:,.2f}")
@@ -520,6 +577,8 @@ def main() -> None:
     cols_path = feature_cols_path_for_model(args.model_path)
 
     if args.train:
+        target_mode = load_training_target_mode(args.training_dir)
+        print(f"Training target mode (from dataset): {target_mode}")
         print("Loading train/val/test splits...")
         train, val, test = load_splits(args.training_dir)
         print(f"  train={len(train)} val={len(val)} test={len(test)}")
@@ -533,14 +592,18 @@ def main() -> None:
             print(f"\nTraining final model on train+val ({len(train) + len(val)} rows)...")
             model = train_with_best_params(train, val, args.label_column, best_params, feature_cols)
 
-        evaluate(model, test, feature_cols, args.label_column, split_name="test")
+        evaluate(
+            model, test, feature_cols, args.label_column, split_name="test", target_mode=target_mode
+        )
         print_feature_importance(model, feature_cols)
 
-        os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
+        os.makedirs(os.path.dirname(args.model_path) or ".", exist_ok=True)
         model.save_model(args.model_path)
         save_feature_columns(cols_path, feature_cols)
+        save_model_target_mode(args.model_path, target_mode)
         print(f"\nModel saved to {args.model_path}")
         print(f"Feature columns saved to {cols_path}")
+        print(f"Target mode saved to {model_target_mode_path(args.model_path)}")
 
     elif args.recommend:
         if not os.path.exists(args.model_path):
@@ -567,8 +630,16 @@ def main() -> None:
         if forbidden:
             raise RuntimeError(f"recommendation features contain stale forbidden columns: {sorted(forbidden)}")
 
-        ranked = recommend(model, feature_cols, features_df, top_k=args.top_k, budget=args.budget)
-        format_recommendations(ranked)
+        tmode = load_model_target_mode(args.model_path)
+        ranked = recommend(
+            model,
+            feature_cols,
+            features_df,
+            top_k=args.top_k,
+            budget=args.budget,
+            target_mode=tmode,
+        )
+        format_recommendations(ranked, target_mode=tmode)
 
     else:
         parser.print_help()

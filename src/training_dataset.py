@@ -23,6 +23,8 @@ Important design choices:
           query_name | candidate_table | candidate_cols
     - Does NOT support legacy candidate-level label broadcasting.
     - Uses only individual HypoPG optimizer-estimated labels.
+    - Default label: winsorized raw -> signed-log1p -> per-query z-score (see --legacy-label).
+    - Writes data/training/target_mode.txt for ml_model.py recommend/evaluate alignment.
     - Removes label_raw and label_source from train/val/test exports to avoid leakage.
     - Splits by query_name, not by random row, to reduce query-template leakage.
 """
@@ -43,10 +45,13 @@ from candidate_generator import generate_candidates
 from feature_extractor import build_feature_rows
 from db_utils import get_connection
 
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_SRC_DIR)
 
-QUERIES_DIR = "queries"
-DEFAULT_LABELS_PATH = "data/labels.csv"
-DEFAULT_OUTPUT_DIR = "data/training"
+QUERIES_DIR = os.path.join(_REPO_ROOT, "queries")
+DEFAULT_LABELS_PATH = os.path.join(_REPO_ROOT, "data", "labels.csv")
+DEFAULT_OUTPUT_DIR = os.path.join(_REPO_ROOT, "data", "training")
+TARGET_MODE_FILE = "target_mode.txt"
 DEFAULT_MIN_COST_IMPACT = 50000.0
 DEFAULT_SEED = 42
 
@@ -93,6 +98,32 @@ def signed_log1p(x: float) -> float:
     return math.copysign(math.log1p(abs(x)), x)
 
 
+def winsorize_label_raw(raw: pd.Series, lo_q: float = 0.01, hi_q: float = 0.99) -> pd.Series:
+    """Clip extreme HypoPG deltas before log transform so one spike does not dominate."""
+    lo = float(raw.quantile(lo_q))
+    hi = float(raw.quantile(hi_q))
+    return raw.astype(float).clip(lo, hi)
+
+
+def per_query_zscore(log_label: pd.Series, query_name: pd.Series) -> pd.Series:
+    """
+    Zero-mean, unit-variance within each query template.
+
+    Encourages the model to learn relative candidate quality per query (ranking-friendly)
+    instead of only global log-magnitude.
+    """
+
+    def _z(s: pd.Series) -> pd.Series:
+        std = float(s.std(ddof=0))
+        if len(s) < 2 or std < 1e-9:
+            return pd.Series(0.0, index=s.index)
+        mu = float(s.mean())
+        return (s.astype(float) - mu) / std
+
+    df = pd.DataFrame({"y": log_label.astype(float), "q": query_name.astype(str)})
+    return df.groupby("q", sort=False)["y"].transform(_z)
+
+
 def build_features(min_cost_impact: float = DEFAULT_MIN_COST_IMPACT) -> pd.DataFrame:
     """Run workload_parser -> candidate_generator -> feature_extractor."""
     workload = parse_workload(QUERIES_DIR)
@@ -100,7 +131,9 @@ def build_features(min_cost_impact: float = DEFAULT_MIN_COST_IMPACT) -> pd.DataF
 
     conn = get_connection()
     try:
-        feature_rows = build_feature_rows(conn, candidates, workload)
+        feature_rows = build_feature_rows(
+            conn, candidates, workload, queries_dir=QUERIES_DIR
+        )
     finally:
         conn.close()
 
@@ -192,6 +225,7 @@ def validate_exact_alignment(features: pd.DataFrame, labels: pd.DataFrame) -> No
 def build_training_dataset(
     labels_path: str | os.PathLike[str] = DEFAULT_LABELS_PATH,
     min_cost_impact: float = DEFAULT_MIN_COST_IMPACT,
+    legacy_label: bool = False,
 ) -> pd.DataFrame:
     """Build exact joined dataset and transform labels."""
     features = build_features(min_cost_impact=min_cost_impact)
@@ -207,10 +241,16 @@ def build_training_dataset(
     if dataset["label_raw"].isna().any():
         raise RuntimeError("merged dataset contains missing label_raw values")
 
+    dataset["label_raw"] = winsorize_label_raw(dataset["label_raw"])
     dataset["label"] = dataset["label_raw"].map(signed_log1p)
 
     if dataset["label"].isna().any():
         raise RuntimeError("label transform produced NaN values")
+
+    if not legacy_label:
+        dataset["label"] = per_query_zscore(dataset["label"], dataset["query_name"])
+        if dataset["label"].isna().any():
+            raise RuntimeError("per-query z-score produced NaN values")
 
     return dataset
 
@@ -265,6 +305,7 @@ def save_splits(
     dataset: pd.DataFrame,
     output_dir: str | os.PathLike[str] = DEFAULT_OUTPUT_DIR,
     seed: int = DEFAULT_SEED,
+    legacy_label: bool = False,
 ) -> Dict[str, Path]:
     """Save all/debug/train/val/test CSV files using query-template split."""
     out = Path(output_dir)
@@ -300,6 +341,11 @@ def save_splits(
     train_clean.to_csv(paths["train"], index=False)
     val_clean.to_csv(paths["val"], index=False)
     test_clean.to_csv(paths["test"], index=False)
+
+    mode_path = out / TARGET_MODE_FILE
+    mode = "signed_log1p" if legacy_label else "per_query_zscore"
+    mode_path.write_text(mode + "\n", encoding="utf-8")
+    paths["target_mode"] = mode_path
 
     return paths
 
@@ -356,6 +402,8 @@ def print_summary(dataset: pd.DataFrame, paths: Dict[str, Path]) -> None:
         print(f"  {name:>5}: {path}")
     print("\nSanity check passed: feature rows + HypoPG labels are exactly aligned,")
     print("and train/val/test are split by query_name to reduce template leakage.")
+    if paths.get("target_mode") and paths["target_mode"].exists():
+        print(f"Target mode written to {paths['target_mode']}")
     print("=" * 60)
 
     preview_cols = [
@@ -378,13 +426,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for train/val/test CSVs")
     parser.add_argument("--min-cost-impact", type=float, default=DEFAULT_MIN_COST_IMPACT)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--legacy-label",
+        action="store_true",
+        help="Use winsorized signed-log1p only (no per-query z-score). Default is ranking-friendlier z-score target.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    dataset = build_training_dataset(labels_path=args.labels, min_cost_impact=args.min_cost_impact)
-    paths = save_splits(dataset, output_dir=args.output_dir, seed=args.seed)
+    dataset = build_training_dataset(
+        labels_path=args.labels,
+        min_cost_impact=args.min_cost_impact,
+        legacy_label=args.legacy_label,
+    )
+    paths = save_splits(
+        dataset,
+        output_dir=args.output_dir,
+        seed=args.seed,
+        legacy_label=args.legacy_label,
+    )
     validate_training_exports(paths)
     print_summary(dataset, paths)
 
